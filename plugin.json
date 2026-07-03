@@ -1,0 +1,8 @@
+{
+  "$schema": "https://raw.githubusercontent.com/SteamClientHomebrew/Millennium/main/src/sys/plugin-schema.json",
+  "name": "profile-presets",
+  "common_name": "Profile Presets",
+  "description": "Save and switch between multiple Steam profile configurations",
+  "version": "1.0.0",
+  "backendType": "lua"
+}
