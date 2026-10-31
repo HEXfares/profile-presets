@@ -196,11 +196,19 @@ function FetchScreenshotAsset(url)
             or host == "steamuserimages-a.akamaihd.net" or host == "steamcdn-a.akamaihd.net") then
             return json.encode({ success = false, error = "Screenshot asset host is not supported" })
         end
-        local response, request_error = http.get(url, { timeout = 8, follow_redirects = false, verify_ssl = true })
+        local temporary_path = os.tmpname()
+        local response, request_error = http.download(url, temporary_path)
         if not response or response.status ~= 200 then
+            os.remove(temporary_path)
             return json.encode({ success = false, error = request_error or ("Image HTTP " .. tostring(response and response.status)) })
         end
-        local body = response.body
+        local file, file_error = io.open(temporary_path, "rb")
+        local body = file and file:read("*a") or nil
+        if file then file:close() end
+        os.remove(temporary_path)
+        if not body and file_error then
+            return json.encode({ success = false, error = "Cannot read screenshot asset: " .. tostring(file_error) })
+        end
         if type(body) ~= "string" or #body < 12 or #body > 8388608 then
             return json.encode({ success = false, error = "Screenshot asset is empty or exceeds 8 MiB" })
         end
