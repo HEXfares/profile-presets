@@ -1,6 +1,9 @@
 local json       = require("json")
 local logger     = require("logger")
 local millennium = require("millennium")
+local fs         = require("fs")
+local http       = require("http")
+local utils      = require("utils")
 
 local function get_presets_dir()
     return millennium.get_install_path() .. "/presets"
@@ -41,21 +44,14 @@ local function sanitize_steam_id(steam_id)
 end
 
 local function ensure_dir(dir)
-    local sep = package.config:sub(1, 1)
-    if sep == "\\" then
-        os.execute('if not exist "' .. dir:gsub("/", "\\") .. '" mkdir "' .. dir:gsub("/", "\\") .. '"')
-    else
-        os.execute('mkdir -p "' .. dir .. '"')
-    end
+    if fs.is_directory(dir) then return end
+    local ok, err = fs.create_directories(dir)
+    if not ok and not fs.is_directory(dir) then error("Cannot create preset directory: " .. tostring(err)) end
 end
 
 local function remove_dir(dir)
-    local sep = package.config:sub(1, 1)
-    if sep == "\\" then
-        os.execute('rmdir /s /q "' .. dir:gsub("/", "\\") .. '"')
-    else
-        os.execute('rm -rf "' .. dir .. '"')
-    end
+    local removed, err = fs.remove_all(dir)
+    if removed == nil then error("Cannot remove preset directory: " .. tostring(err)) end
 end
 
 local function write_file(path, content)
@@ -65,8 +61,9 @@ local function write_file(path, content)
     if not f then
         return false, "Cannot open for write: " .. (err or "unknown") .. " [" .. path .. "]"
     end
-    f:write(content)
-    f:close()
+    local written, write_err = f:write(content)
+    local closed, close_err = f:close()
+    if not written or not closed then return false, tostring(write_err or close_err or "Write failed") end
     return true
 end
 
@@ -188,6 +185,40 @@ local function migrate_legacy_presets()
         (unknown_count > 0 and (", " .. unknown_count .. " under presets/unknown/ (no steamId on file)") or ""))
 end
 
+function FetchScreenshotAsset(url)
+    local success, result = pcall(function()
+        if type(url) ~= "string" or #url > 4096 or url:find("[%c%s]") then
+            return json.encode({ success = false, error = "Invalid screenshot asset URL" })
+        end
+        local host = url:match("^https://([%w%.%-]+)/")
+        host = host and host:lower() or ""
+        if not (host:match("%.steamstatic%.com$") or host:match("%.steamusercontent%.com$")
+            or host == "steamuserimages-a.akamaihd.net" or host == "steamcdn-a.akamaihd.net") then
+            return json.encode({ success = false, error = "Screenshot asset host is not supported" })
+        end
+        local response, request_error = http.get(url, { timeout = 8, follow_redirects = false, verify_ssl = true })
+        if not response or response.status ~= 200 then
+            return json.encode({ success = false, error = request_error or ("Image HTTP " .. tostring(response and response.status)) })
+        end
+        local body = response.body
+        if type(body) ~= "string" or #body < 12 or #body > 8388608 then
+            return json.encode({ success = false, error = "Screenshot asset is empty or exceeds 8 MiB" })
+        end
+        local mime = nil
+        if body:sub(1, 8) == string.char(137) .. "PNG\r\n" .. string.char(26) .. "\n" then mime = "image/png"
+        elseif body:sub(1, 3) == string.char(255, 216, 255) then mime = "image/jpeg"
+        elseif body:sub(1, 6) == "GIF87a" or body:sub(1, 6) == "GIF89a" then mime = "image/gif"
+        elseif body:sub(1, 4) == "RIFF" and body:sub(9, 12) == "WEBP" then mime = "image/webp" end
+        if not mime then return json.encode({ success = false, error = "Unsupported screenshot asset format" }) end
+        return json.encode({ success = true, mime = mime, base64 = utils.base64_encode(body) })
+    end)
+    if not success then
+        logger:error("Screenshot asset retrieval failed: " .. tostring(result))
+        return json.encode({ success = false, error = tostring(result) })
+    end
+    return result
+end
+
 function ListPresets(steam_id)
     local success, result = pcall(function()
         migrate_legacy_presets()
@@ -232,6 +263,67 @@ function ListPresets(steam_id)
     return result
 end
 
+local function validate_screenshot(content)
+    if type(content) ~= "string" or #content < 100 or #content > 4194304 or #content % 4 ~= 0
+        or content:find("[^A-Za-z0-9+/=]") or not content:match("^/9j/") then
+        return false, "Invalid JPEG screenshot data"
+    end
+    local alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+    local bytes = {}
+    for offset = 1, #content, 4 do
+        local value, padding = 0, 0
+        for index = offset, offset + 3 do
+            local character = content:sub(index, index)
+            if character == "=" then
+                padding = padding + 1
+                if offset + 3 ~= #content or index < offset + 2 then return false, "Invalid base64 padding" end
+                value = value * 64
+            else
+                if padding > 0 then return false, "Invalid base64 padding" end
+                local position = alphabet:find(character, 1, true)
+                if not position then return false, "Invalid base64 data" end
+                value = value * 64 + position - 1
+            end
+        end
+        bytes[#bytes + 1] = string.char(math.floor(value / 65536) % 256)
+        if padding < 2 then bytes[#bytes + 1] = string.char(math.floor(value / 256) % 256) end
+        if padding < 1 then bytes[#bytes + 1] = string.char(value % 256) end
+    end
+    local decoded = table.concat(bytes)
+    if decoded:sub(1, 2) ~= string.char(255, 216) or decoded:sub(-2) ~= string.char(255, 217) then
+        return false, "Incomplete JPEG screenshot"
+    end
+    return true
+end
+
+local function write_screenshot(path, content)
+    if read_file(path) == content then return true end
+    local temporary = path .. ".tmp"
+    local previous = path .. ".previous"
+    if file_exists(previous) then return false, "Screenshot recovery file exists; original image preserved" end
+    local ok, err = write_file(temporary, content)
+    if not ok or read_file(temporary) ~= content then
+        os.remove(temporary)
+        return false, err or "Screenshot verification failed"
+    end
+    local had_previous = file_exists(path)
+    if had_previous then
+        local moved, move_error = os.rename(path, previous)
+        if not moved then
+            os.remove(temporary)
+            return false, move_error or "Cannot preserve previous screenshot"
+        end
+    end
+    local committed, commit_error = os.rename(temporary, path)
+    if not committed then
+        if had_previous then os.rename(previous, path) end
+        os.remove(temporary)
+        return false, commit_error or "Cannot commit screenshot"
+    end
+    if had_previous then os.remove(previous) end
+    return true
+end
+
 function SavePreset(preset_json, steam_id)
     local success, result = pcall(function()
         migrate_legacy_presets()
@@ -264,14 +356,33 @@ function SavePreset(preset_json, steam_id)
             data.avatarBase64 = nil
         end
 
-        if data.screenshotBase64 and data.screenshotBase64 ~= "" then
-            local sc_ok, sc_err = write_file(screenshot_path(sid, safe_name), data.screenshotBase64)
-            if not sc_ok then
-                logger:error("Screenshot write failed: " .. (sc_err or ""))
-            end
-            data.hasScreenshot = true
-            data.screenshotBase64 = nil
+        local screenshot_error = type(data.screenshotError) == "string" and data.screenshotError or nil
+        data.screenshotError = nil
+        local previous_content = read_file(preset_path(sid, safe_name))
+        local previous = nil
+        if previous_content then
+            local previous_ok, decoded = pcall(json.decode, previous_content)
+            if previous_ok and type(decoded) == "table" then previous = decoded end
         end
+        data.hasScreenshot = previous and previous.hasScreenshot and file_exists(screenshot_path(sid, safe_name)) or false
+        data.screenshotMime = previous and previous.screenshotMime or "image/jpeg"
+        if data.screenshotBase64 and data.screenshotBase64 ~= "" then
+            local screenshot = data.screenshotBase64
+            local valid, validation_error = validate_screenshot(screenshot)
+            if valid then
+                local sc_ok, sc_err = write_screenshot(screenshot_path(sid, safe_name), screenshot)
+                if sc_ok then
+                    data.hasScreenshot = true
+                    data.screenshotMime = "image/jpeg"
+                else
+                    screenshot_error = sc_err
+                end
+            else
+                screenshot_error = validation_error
+            end
+        end
+        data.screenshotBase64 = nil
+        if screenshot_error then logger:error("Screenshot failed: " .. screenshot_error) end
 
         local write_ok, write_err = write_file(preset_path(sid, safe_name), json.encode(data))
         if not write_ok then
@@ -281,7 +392,7 @@ function SavePreset(preset_json, steam_id)
         index_add(sid, safe_name)
 
         logger:info("Preset saved: " .. name .. " -> " .. sid .. "/" .. safe_name)
-        return json.encode({ success = true, name = name })
+        return json.encode({ success = true, name = name, screenshotError = screenshot_error })
     end)
 
     if not success then
@@ -429,4 +540,5 @@ return {
     LoadPreset        = LoadPreset,
     DeletePreset      = DeletePreset,
     LogApplySummary   = LogApplySummary,
+    FetchScreenshotAsset = FetchScreenshotAsset,
 }
